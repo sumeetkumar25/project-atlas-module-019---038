@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from atlas.core.base_research_module import BaseResearchModule
+from atlas.core.rolling_market_features import compute_rolling_entropy
 from atlas.framework.registry import AtlasRegistry
 
 from .engine import EntropyEngine
@@ -38,6 +39,7 @@ class EntropyResearch(BaseResearchModule):
         self.stats_engine = EntropyStatisticsEngine()
         self.result_entropy = None
         self.statistics = None
+        self.rolling_entropy = None
 
     def _register_pipeline_steps(self):
         self.pipeline_steps = [
@@ -48,39 +50,136 @@ class EntropyResearch(BaseResearchModule):
         ]
 
     def _compute_entropy(self) -> Dict[str, Any]:
-        self.logger.info("Step 1: Computing Shannon entropy on log returns")
+        self.logger.info(
+            "Step 1: Computing full-sample and rolling Shannon entropy"
+        )
 
-        prices = self.df["close"].astype(float)
+        prices = pd.to_numeric(
+            self.df["close"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(prices).all() or np.any(prices <= 0):
+            raise ValueError("Invalid close prices for entropy calculation.")
+
+        # Preserve the original full-sample entropy calculation.
         returns = np.diff(np.log(prices))
         returns = returns[np.isfinite(returns)]
 
-        self.result_entropy = self.engine.compute(returns, series_type="log_returns")
+        self.result_entropy = self.engine.compute(
+            returns,
+            series_type="log_returns",
+        )
 
-        self.logger.metric("Entropy", f"{self.result_entropy.entropy:.4f} bits")
-        self.logger.metric("Normalized", f"{self.result_entropy.normalized_entropy:.4f}")
-        self.logger.metric("Max entropy", f"{self.result_entropy.max_entropy:.4f} bits")
-        self.logger.metric("Bins", f"{len(self.result_entropy.probabilities)}")
-        self.logger.success("Entropy computed")
+        # New causal rolling entropy feature.
+        if self.market_df is None:
+            raise RuntimeError("Module 037 market_df is unavailable.")
+
+        self.rolling_entropy = compute_rolling_entropy(
+            timestamps=self.market_df["timestamp"],
+            close=self.market_df["close"],
+            window_days=60,
+        )
+
+        finite_rolling = self.rolling_entropy[
+            np.isfinite(self.rolling_entropy)
+        ]
+
+        if len(finite_rolling) < 200:
+            raise ValueError(
+                "Insufficient finite rolling entropy observations: "
+                f"{len(finite_rolling)} < 200"
+            )
+
+        if np.unique(np.round(finite_rolling, 10)).size < 2:
+            raise ValueError("Rolling entropy feature is constant.")
+
+        if np.any((finite_rolling < 0) | (finite_rolling > 1)):
+            raise ValueError("Rolling entropy outside [0, 1].")
+
+        self.logger.metric(
+            "Entropy",
+            f"{self.result_entropy.entropy:.4f} bits",
+        )
+        self.logger.metric(
+            "Normalized",
+            f"{self.result_entropy.normalized_entropy:.4f}",
+        )
+        self.logger.metric(
+            "Max entropy",
+            f"{self.result_entropy.max_entropy:.4f} bits",
+        )
+        self.logger.metric(
+            "Bins",
+            f"{len(self.result_entropy.probabilities)}",
+        )
+        self.logger.metric(
+            "Rolling entropy valid rows",
+            f"{len(finite_rolling):,}",
+        )
+        self.logger.metric(
+            "Rolling entropy mean",
+            f"{float(np.mean(finite_rolling)):.4f}",
+        )
+        self.logger.success("Entropy and rolling feature computed")
 
         return {
             "entropy": self.result_entropy.entropy,
             "normalized_entropy": self.result_entropy.normalized_entropy,
             "sample_size": self.result_entropy.sample_size,
+            "rolling_entropy_valid_rows": len(finite_rolling),
         }
 
     def _compute_statistics(self) -> Dict[str, Any]:
         self.logger.info("Step 2: Computing statistics")
         self.statistics = self.stats_engine.analyze(self.result_entropy)
         self.logger.metric("Regime", self.statistics.regime)
-        self.logger.metric("Populated bins", f"{self.statistics.num_nonzero_bins}/{self.statistics.num_bins}")
+        self.logger.metric(
+            "Populated bins",
+            f"{self.statistics.num_nonzero_bins}/{self.statistics.num_bins}",
+        )
         self.logger.success("Statistics computed")
         return self.stats_engine.summary_dict(self.statistics)
 
     def _validate(self) -> Dict[str, Any]:
         self.logger.info("Step 3: Validation")
-        passed = run_validation(self.result_entropy, self.statistics)
-        self.logger.success("Validation complete")
-        return {"validation_passed": passed}
+
+        passed = run_validation(
+            self.result_entropy,
+            self.statistics,
+        )
+
+        if not passed:
+            raise RuntimeError("Module 037 full-sample validation failed.")
+
+        if self.rolling_entropy is None:
+            raise RuntimeError("Rolling entropy feature was not calculated.")
+
+        if len(self.rolling_entropy) != len(self.market_df):
+            raise RuntimeError("Rolling entropy row count mismatch.")
+
+        finite = self.rolling_entropy[
+            np.isfinite(self.rolling_entropy)
+        ]
+
+        if len(finite) < 200:
+            raise RuntimeError("Insufficient rolling entropy observations.")
+
+        if np.unique(np.round(finite, 10)).size < 2:
+            raise RuntimeError("Rolling entropy feature is constant.")
+
+        if np.any((finite < 0) | (finite > 1)):
+            raise RuntimeError("Rolling entropy outside [0, 1].")
+
+        self.logger.success(
+            "Full-sample and rolling entropy validation passed"
+        )
+
+        return {
+            "validation_passed": True,
+            "rolling_feature_valid": True,
+            "rolling_valid_rows": len(finite),
+        }
 
     def _export_results(self) -> Dict[str, Any]:
         self.logger.info("Step 4: Export")
@@ -107,17 +206,27 @@ class EntropyResearch(BaseResearchModule):
         # ----------------------------------------------------------
         # Export feature DataFrame for downstream modules
         # ----------------------------------------------------------
-        feature_df = self.market_df[["timestamp"]].copy()
+        feature_df = self.market_df[["timestamp"]].copy().reset_index(drop=True)
 
-        feature_df["normalized_entropy"] = self.statistics.normalized_entropy
+        # Preserve the original full-sample descriptive feature.
+        feature_df["normalized_entropy"] = (
+            self.statistics.normalized_entropy
+        )
+
+        # New causal rolling feature for Module 103.
+        feature_df["normalized_entropy_rolling_60d"] = (
+            self.rolling_entropy
+        )
+
+        if len(feature_df) != len(self.market_df):
+            raise RuntimeError("Module 037 export row count mismatch.")
+
+        if not np.isfinite(
+            feature_df["normalized_entropy_rolling_60d"].dropna()
+        ).all():
+            raise RuntimeError("Invalid rolling entropy export values.")
 
         self.result.artifacts["features"] = feature_df
-
-        # Safety checks
-        assert "features" in self.result.artifacts
-        assert "timestamp" in feature_df.columns
-        assert "normalized_entropy" in feature_df.columns
-        assert len(feature_df) == len(self.market_df)
 
         self.logger.metric("Artifacts", str(len(self.result.artifacts)))
         self.logger.success("Export complete")
