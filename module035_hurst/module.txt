@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from atlas.core.base_research_module import BaseResearchModule
+from atlas.core.rolling_market_features import compute_rolling_hurst
 from atlas.framework.registry import AtlasRegistry
 
 from .engine import HurstEngine
@@ -38,6 +39,7 @@ class HurstResearch(BaseResearchModule):
         self.stats_engine = HurstStatisticsEngine()
         self.result_hurst = None
         self.statistics = None
+        self.rolling_hurst = None
 
     def _register_pipeline_steps(self):
         self.pipeline_steps = [
@@ -48,24 +50,69 @@ class HurstResearch(BaseResearchModule):
         ]
 
     def _compute_hurst(self) -> Dict[str, Any]:
-        self.logger.info("Step 1: Computing Hurst exponent on log returns")
+        self.logger.info(
+            "Step 1: Computing full-sample and rolling Hurst exponent"
+        )
 
-        prices = self.df["close"].astype(float)
+        prices = pd.to_numeric(
+            self.df["close"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(prices).all() or np.any(prices <= 0):
+            raise ValueError("Invalid close prices for Hurst calculation.")
+
+        # Preserve the existing full-dataset descriptive statistic.
         returns = np.diff(np.log(prices))
         returns = returns[np.isfinite(returns)]
 
-        self.result_hurst = self.engine.compute(returns, series_type="log_returns")
+        self.result_hurst = self.engine.compute(
+            returns,
+            series_type="log_returns",
+        )
+
+        # New causal rolling feature.
+        if self.market_df is None:
+            raise RuntimeError("Module 035 market_df is unavailable.")
+
+        self.rolling_hurst = compute_rolling_hurst(
+            timestamps=self.market_df["timestamp"],
+            close=self.market_df["close"],
+            window_days=60,
+        )
+
+        finite_rolling = self.rolling_hurst[
+            np.isfinite(self.rolling_hurst)
+        ]
+
+        if len(finite_rolling) < 200:
+            raise ValueError(
+                "Insufficient finite rolling Hurst observations: "
+                f"{len(finite_rolling)} < 200"
+            )
+
+        if np.unique(np.round(finite_rolling, 10)).size < 2:
+            raise ValueError("Rolling Hurst feature is constant.")
 
         self.logger.metric("Series type", self.result_hurst.series_type)
         self.logger.metric("Hurst exponent", f"{self.result_hurst.hurst_exponent:.4f}")
         self.logger.metric("Sample size", f"{self.result_hurst.sample_size:,}")
         self.logger.metric("Windows", f"{len(self.result_hurst.scales)}")
-        self.logger.success("Hurst exponent computed")
+        self.logger.metric(
+            "Rolling Hurst valid rows",
+            f"{len(finite_rolling):,}",
+        )
+        self.logger.metric(
+            "Rolling Hurst mean",
+            f"{float(np.mean(finite_rolling)):.4f}",
+        )
+        self.logger.success("Hurst exponent and rolling feature computed")
 
         return {
             "hurst_exponent": self.result_hurst.hurst_exponent,
             "sample_size": self.result_hurst.sample_size,
             "series_type": self.result_hurst.series_type,
+            "rolling_hurst_valid_rows": len(finite_rolling),
         }
 
     def _compute_statistics(self) -> Dict[str, Any]:
@@ -78,9 +125,40 @@ class HurstResearch(BaseResearchModule):
 
     def _validate(self) -> Dict[str, Any]:
         self.logger.info("Step 3: Validation")
-        passed = run_validation(self.result_hurst, self.statistics)
-        self.logger.success("Validation complete")
-        return {"validation_passed": passed}
+
+        passed = run_validation(
+            self.result_hurst,
+            self.statistics,
+        )
+
+        if not passed:
+            raise RuntimeError("Module 035 full-sample validation failed.")
+
+        if self.rolling_hurst is None:
+            raise RuntimeError("Rolling Hurst feature was not calculated.")
+
+        if len(self.rolling_hurst) != len(self.market_df):
+            raise RuntimeError("Rolling Hurst row count mismatch.")
+
+        finite = self.rolling_hurst[
+            np.isfinite(self.rolling_hurst)
+        ]
+
+        if len(finite) < 200:
+            raise RuntimeError("Insufficient rolling Hurst observations.")
+
+        if np.unique(np.round(finite, 10)).size < 2:
+            raise RuntimeError("Rolling Hurst feature is constant.")
+
+        self.logger.success(
+            "Full-sample and rolling Hurst validation passed"
+        )
+
+        return {
+            "validation_passed": True,
+            "rolling_feature_valid": True,
+            "rolling_valid_rows": len(finite),
+        }
 
     def _export_results(self) -> Dict[str, Any]:
         self.logger.info("Step 4: Export")
@@ -105,18 +183,27 @@ class HurstResearch(BaseResearchModule):
         # ----------------------------------------------------------
         # Export feature DataFrame for downstream modules
         # ----------------------------------------------------------
-        feature_df = self.market_df[["timestamp"]].copy()
+        feature_df = self.market_df[["timestamp"]].copy().reset_index(drop=True)
 
-        # Temporary dataset-level feature
-        feature_df["hurst_exponent"] = self.result_hurst.hurst_exponent
+        # Preserve the original full-sample feature.
+        feature_df["hurst_exponent"] = (
+            self.result_hurst.hurst_exponent
+        )
+
+        # New causal rolling feature for Module 103.
+        feature_df["hurst_exponent_rolling_60d"] = (
+            self.rolling_hurst
+        )
+
+        if len(feature_df) != len(self.market_df):
+            raise RuntimeError("Module 035 export row count mismatch.")
+
+        if not np.isfinite(
+            feature_df["hurst_exponent_rolling_60d"].dropna()
+        ).all():
+            raise RuntimeError("Invalid rolling Hurst export values.")
 
         self.result.artifacts["features"] = feature_df
-
-        # Safety checks
-        assert "features" in self.result.artifacts
-        assert "timestamp" in feature_df.columns
-        assert "hurst_exponent" in feature_df.columns
-        assert len(feature_df) == len(self.market_df)
 
         self.logger.metric("Artifacts", str(len(self.result.artifacts)))
         self.logger.success("Export complete")
