@@ -5,6 +5,9 @@ Shannon Entropy Analysis
 Pipeline: log returns → entropy → statistics → validation → report → export
 
 FIXED: Exports full histogram with consistent array lengths.
+
+Full-sample and rolling entropy share the same gap-aware log-return
+series, so both statistics are computed on identical observations.
 """
 
 from typing import Optional, Dict, Any
@@ -13,7 +16,10 @@ import numpy as np
 import pandas as pd
 
 from atlas.core.base_research_module import BaseResearchModule
-from atlas.core.rolling_market_features import compute_rolling_entropy
+from atlas.core.rolling_market_features import (
+    compute_rolling_entropy,
+    compute_gap_aware_log_returns,
+)
 from atlas.framework.registry import AtlasRegistry
 
 from .engine import EntropyEngine
@@ -62,9 +68,26 @@ class EntropyResearch(BaseResearchModule):
         if not np.isfinite(prices).all() or np.any(prices <= 0):
             raise ValueError("Invalid close prices for entropy calculation.")
 
-        # Preserve the original full-sample entropy calculation.
-        returns = np.diff(np.log(prices))
+        # ----------------------------------------------------------
+        # Full-sample return series.
+        #
+        # Uses the same gap-aware computation as the rolling helper,
+        # so both full-sample and rolling entropy are computed on
+        # identically-cleaned log returns.
+        # ----------------------------------------------------------
+        if self.market_df is None:
+            raise RuntimeError("Module 037 market_df is unavailable.")
+
+        returns = compute_gap_aware_log_returns(
+            timestamps=self.market_df["timestamp"],
+            close=self.market_df["close"],
+        )
         returns = returns[np.isfinite(returns)]
+
+        if len(returns) < 100:
+            raise ValueError(
+                f"Insufficient valid log returns: {len(returns)}"
+            )
 
         self.result_entropy = self.engine.compute(
             returns,
@@ -72,9 +95,6 @@ class EntropyResearch(BaseResearchModule):
         )
 
         # New causal rolling entropy feature.
-        if self.market_df is None:
-            raise RuntimeError("Module 037 market_df is unavailable.")
-
         self.rolling_entropy = compute_rolling_entropy(
             timestamps=self.market_df["timestamp"],
             close=self.market_df["close"],
