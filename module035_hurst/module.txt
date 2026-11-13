@@ -5,6 +5,9 @@ Hurst Exponent Estimation
 Pipeline: log returns → R/S analysis → statistics → validation → report → export
 
 FIXED: Computes log returns before Hurst analysis. Stores series_type.
+
+Full-sample and rolling Hurst share the same gap-aware log-return
+series, so both statistics are computed on identical observations.
 """
 
 from typing import Optional, Dict, Any
@@ -13,7 +16,10 @@ import numpy as np
 import pandas as pd
 
 from atlas.core.base_research_module import BaseResearchModule
-from atlas.core.rolling_market_features import compute_rolling_hurst
+from atlas.core.rolling_market_features import (
+    compute_rolling_hurst,
+    compute_gap_aware_log_returns,
+)
 from atlas.framework.registry import AtlasRegistry
 
 from .engine import HurstEngine
@@ -62,9 +68,32 @@ class HurstResearch(BaseResearchModule):
         if not np.isfinite(prices).all() or np.any(prices <= 0):
             raise ValueError("Invalid close prices for Hurst calculation.")
 
-        # Preserve the existing full-dataset descriptive statistic.
-        returns = np.diff(np.log(prices))
+        # ----------------------------------------------------------
+        # Full-sample return series.
+        #
+        # Uses the same gap-aware computation as the rolling helper,
+        # so both full-sample and rolling Hurst are computed on
+        # identically-cleaned log returns: NaNs are present where
+        # the timestamp gap is not exactly one expected candle
+        # interval, and those rows are dropped before scoring.
+        #
+        # Requires market_df to be loaded (BaseResearchModule always
+        # provides it by the time this step runs — the earlier patch
+        # already enforced this for the rolling feature).
+        # ----------------------------------------------------------
+        if self.market_df is None:
+            raise RuntimeError("Module 035 market_df is unavailable.")
+
+        returns = compute_gap_aware_log_returns(
+            timestamps=self.market_df["timestamp"],
+            close=self.market_df["close"],
+        )
         returns = returns[np.isfinite(returns)]
+
+        if len(returns) < 100:
+            raise ValueError(
+                f"Insufficient valid log returns: {len(returns)}"
+            )
 
         self.result_hurst = self.engine.compute(
             returns,
@@ -72,9 +101,6 @@ class HurstResearch(BaseResearchModule):
         )
 
         # New causal rolling feature.
-        if self.market_df is None:
-            raise RuntimeError("Module 035 market_df is unavailable.")
-
         self.rolling_hurst = compute_rolling_hurst(
             timestamps=self.market_df["timestamp"],
             close=self.market_df["close"],
