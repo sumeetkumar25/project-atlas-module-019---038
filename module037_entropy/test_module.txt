@@ -3,12 +3,15 @@
 Module 037 - Integration Test
 
 Tests entropy engine, statistics, validator, report, and pipeline.
+FIXED: sys.path bootstrap (previous conditional inserted None into sys.path).
+FIXED: Full pipeline fixture carries >= 60 calendar days of history
+       (6000 × 15min ≈ 62.5 days) as required by production code.
 """
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path.__file__).parent.parent.parent.parent if hasattr(Path, '__file__') else sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent)))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 import numpy as np
 import pandas as pd
@@ -21,7 +24,7 @@ from atlas.modules.module037_entropy.module import EntropyResearch
 
 
 def test_gaussian():
-    """Test 1: IID Gaussian returns → high entropy (> 0.90)."""
+    """Test 1: IID Gaussian returns → high entropy (> 0.85)."""
     print("\n" + "=" * 60)
     print("TEST 1: IID Gaussian Returns")
     print("=" * 60)
@@ -150,14 +153,22 @@ def test_pipeline():
     print("TEST 6: Full Pipeline")
     print("=" * 60)
 
-    n = 500
+    # FIX 8: Production EntropyResearch requires 60 calendar days of rolling
+    # history. 6000 × 15min = 1500 hours ≈ 62.5 days, safely clearing the
+    # 60-day floor. Do NOT lower the production requirement.
+    n = 6000
     np.random.seed(42)
     close = np.cumsum(np.random.normal(0, 1, n)) + 100
     close = np.maximum(close, 1)
 
-    dates = pd.date_range(start="2020-01-01", periods=n, freq="15min")
+    timestamps = pd.date_range(
+        "2020-01-01",
+        periods=n,
+        freq="15min",
+    )
+
     df = pd.DataFrame({
-        "timestamp": dates,
+        "timestamp": timestamps,
         "open": close * 0.999,
         "high": close * 1.002,
         "low": close * 0.998,
@@ -174,6 +185,7 @@ def test_pipeline():
     assert "entropy_report" in result.artifacts
     assert result.statistics.get("validation_passed") == True
 
+    print(f"  Bars used: {len(df)} (≈ {len(df) * 15 / 60 / 24:.1f} days)")
     print(f"  Entropy: {result.statistics.get('entropy'):.4f} bits")
     print(f"  Normalized: {result.statistics.get('normalized_entropy'):.4f}")
     print("  ✓ Full pipeline test passed")
