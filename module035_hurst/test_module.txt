@@ -4,6 +4,8 @@ Module 035 - Integration Test
 
 Tests Hurst engine, statistics, validator, report, and pipeline.
 FIXED: Uses returns (not cumulative prices) for consistent testing.
+FIXED: Full pipeline fixture carries >= 60 calendar days of history
+       (6000 × 15min ≈ 62.5 days) as required by production code.
 """
 
 import sys
@@ -66,7 +68,7 @@ def test_persistent_returns():
     persistent = np.zeros(n)
     persistent[0] = np.random.normal(0, 1)
     for t in range(1, n):
-        persistent[t] = phi * persistent[t-1] + np.random.normal(0, 1)
+        persistent[t] = phi * persistent[t - 1] + np.random.normal(0, 1)
 
     result = engine.compute(persistent, series_type="persistent_returns")
     stats = stats_engine.analyze(result)
@@ -98,7 +100,7 @@ def test_mean_reverting_returns():
     mr = np.zeros(n)
     mr[0] = np.random.normal(0, 1)
     for t in range(1, n):
-        mr[t] = -0.3 * mr[t-1] + np.random.normal(0, 1)
+        mr[t] = -0.3 * mr[t - 1] + np.random.normal(0, 1)
 
     result = engine.compute(mr, series_type="mean_reverting_returns")
     stats = stats_engine.analyze(result)
@@ -166,14 +168,22 @@ def test_pipeline():
     print("TEST 6: Full Pipeline")
     print("=" * 60)
 
-    n = 500
+    # FIX 8: Production HurstResearch requires 60 calendar days of rolling
+    # history. 6000 × 15min = 1500 hours ≈ 62.5 days, safely clearing the
+    # 60-day floor. Do NOT lower the production requirement.
+    n = 6000
     np.random.seed(42)
     close = np.cumsum(np.random.normal(0, 1, n)) + 100
     close = np.maximum(close, 1)
 
-    dates = pd.date_range(start="2020-01-01", periods=n, freq="15min")
+    timestamps = pd.date_range(
+        "2020-01-01",
+        periods=n,
+        freq="15min",
+    )
+
     df = pd.DataFrame({
-        "timestamp": dates,
+        "timestamp": timestamps,
         "open": close * 0.999,
         "high": close * 1.002,
         "low": close * 0.998,
@@ -191,6 +201,7 @@ def test_pipeline():
     assert "hurst_report" in result.artifacts
     assert result.statistics.get("validation_passed") == True
 
+    print(f"  Bars used: {len(df)} (≈ {len(df) * 15 / 60 / 24:.1f} days)")
     print(f"  Series type: {result.statistics.get('series_type')}")
     print(f"  Hurst: {result.statistics.get('hurst_exponent'):.4f}")
     print("  ✓ Full pipeline test passed")
